@@ -95,6 +95,10 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.material.icons.filled.Share
+import androidx.core.content.FileProvider
+import android.content.ClipData
+import java.io.File
 
 private const val ROUTE_MEASURE = "measure"
 private const val ROUTE_HISTORY = "history"
@@ -130,6 +134,39 @@ fun strongVibration(context: Context) {
         @Suppress("DEPRECATION")
         vibrator.vibrate(80L)
     }
+}
+
+fun shareCsv(
+    context: Context,
+    measurementName: String,
+    csv: String
+) {
+    val fileName = "${measurementName.ifBlank { "measurement" }}.csv"
+
+    val exportDir = File(context.cacheDir, "exports").apply {
+        mkdirs()
+    }
+
+    val file = File(exportDir, fileName)
+    file.writeText(csv, Charsets.UTF_8)
+
+    val uri = FileProvider.getUriForFile(
+        context,
+        "${context.packageName}.fileprovider",
+        file
+    )
+
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "text/csv"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        putExtra(Intent.EXTRA_SUBJECT, measurementName)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        clipData = ClipData.newRawUri("CSV", uri)
+    }
+
+    context.startActivity(
+        Intent.createChooser(intent, "Экспорт измерения")
+    )
 }
 
 class PassengerFlowViewModel(
@@ -171,9 +208,25 @@ class PassengerFlowViewModel(
     }
 
     fun updateAutoLocation(value: Boolean) { autoLocation = value }
-    fun incrementEntered() { entered++ }
-    fun incrementExited() { if (exited > 0) exited-- }
-    fun incrementExitedPositive() { exited++ }
+    fun incrementEntered() {
+        entered++
+    }
+
+    fun decrementEntered() {
+        if (entered > 0) entered--
+    }
+
+    fun incrementExited() {
+        exited++
+    }
+
+    fun decrementExited() {
+        if (exited > 0) exited--
+    }
+
+    fun csvValue(value: String): String {
+        return "\"${value.replace("\"", "\"\"")}\""
+    }
 
     suspend fun requestLocation(): Boolean {
         isLoadingLocation = true
@@ -205,6 +258,27 @@ class PassengerFlowViewModel(
         return true
     }
 
+    fun setLastStopName(name: String) {
+        if (stops.isEmpty()) return
+
+        val lastIndex = stops.lastIndex
+        val trimmedName = name.trim()
+
+        val finalName = trimmedName.ifBlank {
+            formatCoords(
+                stops[lastIndex].latitude,
+                stops[lastIndex].longitude
+            )
+        }
+
+        val updatedStops = stops.toMutableList()
+        updatedStops[lastIndex] = updatedStops[lastIndex].copy(
+            name = finalName
+        )
+
+        stops = updatedStops
+    }
+
     fun resetCounters() { entered = 0; exited = 0 }
 
     fun arrive(scope: kotlinx.coroutines.CoroutineScope, onDone: () -> Unit) {
@@ -217,6 +291,7 @@ class PassengerFlowViewModel(
     fun depart() {
         val arrival = arrivalTime ?: return
         stops = stops + StopDraft(
+            name = null,
             latitude = currentLatitude,
             longitude = currentLongitude,
             arrivalTimeMillis = arrival,
@@ -237,6 +312,7 @@ class PassengerFlowViewModel(
             stops.map {
                 StopEntity(
                     measurementId = measurementId,
+                    name = it.name,
                     latitude = it.latitude,
                     longitude = it.longitude,
                     arrivalTimeMillis = it.arrivalTimeMillis,
@@ -263,9 +339,48 @@ class PassengerFlowViewModel(
     fun observeStops(id: Long): Flow<List<StopEntity>> = db.measurementDao().observeStops(id)
 
     suspend fun findMeasurement(id: Long): MeasurementEntity? = db.measurementDao().findMeasurement(id)
+
+    suspend fun buildCsv(measurementId: Long): String {
+        val measurement = db.measurementDao().findMeasurement(measurementId)
+            ?: return ""
+
+        val stops = db.measurementDao().getStops(measurementId)
+
+        return buildString {
+            appendLine("Название измерения;Дата создания")
+            appendLine(
+                "${csvValue(measurement.name)};" +
+                        "${csvValue(formatDateTime(measurement.createdAtMillis))}"
+            )
+
+            appendLine()
+            appendLine(
+                "№;Остановка;Широта;Долгота;Дата;Время прибытия;Время отправления;Вошло;Вышло"
+            )
+
+            stops.forEachIndexed { index, stop ->
+                val stopName = stop.name
+                    ?.takeIf { it.isNotBlank() }
+                    ?: formatCoords(stop.latitude, stop.longitude)
+
+                appendLine(
+                    "${index + 1};" +
+                            "${csvValue(stopName)};" +
+                            "${csvValue(stop.latitude?.toString() ?: "")};" +
+                            "${csvValue(stop.longitude?.toString() ?: "")};" +
+                            "${csvValue(formatDate(stop.arrivalTimeMillis))};" +
+                            "${csvValue(formatTime(stop.arrivalTimeMillis))};" +
+                            "${csvValue(stop.departureTimeMillis?.let(::formatTime) ?: "")};" +
+                            "${stop.entered};" +
+                            "${stop.exited}"
+                )
+            }
+        }
+    }
 }
 
 data class StopDraft(
+    val name: String?,
     val latitude: Double?,
     val longitude: Double?,
     val arrivalTimeMillis: Long,
@@ -330,6 +445,7 @@ fun MeasurementScreen(vm: PassengerFlowViewModel, nav: NavHostController) {
         }
     }
     var showNameDialog by remember { mutableStateOf(false) }
+    var showStopNameDialog by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -351,7 +467,7 @@ fun MeasurementScreen(vm: PassengerFlowViewModel, nav: NavHostController) {
                     enabled = vm.stops.isNotEmpty() && vm.arrivalTime == null,
                     onClick = { showNameDialog = true }
                 ) {
-                    Text("Завершить измерение")
+                    Text("Завершить обследование")
                 }
             }
         }
@@ -391,18 +507,49 @@ fun MeasurementScreen(vm: PassengerFlowViewModel, nav: NavHostController) {
             ) {
                 Icon(Icons.Default.LocationOn, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
-                Text(if (vm.stops.isEmpty() && !vm.sessionActive) "Прибытие" else "Прибытие следующей остановки")
+                Text(if (vm.stops.isEmpty() && !vm.sessionActive) "Прибытие" else "Прибытие на остановку")
             }
 
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                CounterCard("Вошло", vm.entered, symbol = "+", onClick = { vm.incrementEntered(); view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS); strongVibration(context) }, enabled = vm.arrivalTime != null)
-                CounterCard("Вышло", vm.exited, symbol = "−", onClick = { vm.incrementExitedPositive(); view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS); strongVibration(context) }, enabled = vm.arrivalTime != null)
+                CounterCard(
+                    title = "Вошло",
+                    value = vm.entered,
+                    onIncrement = {
+                        vm.incrementEntered()
+                        view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                        strongVibration(context)
+                    },
+                    onDecrement = {
+                        vm.decrementEntered()
+                        view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                        strongVibration(context)
+                    },
+                    enabled = vm.arrivalTime != null
+                )
+                CounterCard(
+                    title = "Вышло",
+                    value = vm.exited,
+                    onIncrement = {
+                        vm.incrementExited()
+                        view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                        strongVibration(context)
+                    },
+                    onDecrement = {
+                        vm.decrementExited()
+                        view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                        strongVibration(context)
+                    },
+                    enabled = vm.arrivalTime != null
+                )
             }
 
             Button(
                 modifier = Modifier.fillMaxWidth().height(54.dp),
                 enabled = vm.arrivalTime != null,
-                onClick = vm::depart
+                onClick = {
+                    vm.depart()
+                    showStopNameDialog = true
+                }
             ) {
                 Icon(Icons.Default.Send, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
@@ -459,17 +606,75 @@ fun MeasurementScreen(vm: PassengerFlowViewModel, nav: NavHostController) {
             }
         )
     }
-
+    if (showStopNameDialog) {
+        StopNameDialog(
+            onDismiss = {
+                vm.setLastStopName("")
+                showStopNameDialog = false
+            },
+            onSave = { name ->
+                vm.setLastStopName(name)
+                showStopNameDialog = false
+            }
+        )
+    }
 }
 
+
 @Composable
-fun CounterCard(title: String, value: Int, symbol: String, onClick: () -> Unit, enabled: Boolean) {
-    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
-        Column(Modifier.padding(14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(title, style = MaterialTheme.typography.labelLarge)
-            Text(value.toString(), style = MaterialTheme.typography.displaySmall, fontWeight = FontWeight.Bold)
-            IconButton(onClick = onClick, enabled = enabled, modifier = Modifier.size(52.dp)) {
-                Text(symbol, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+fun CounterCard(
+    title: String,
+    value: Int,
+    onIncrement: () -> Unit,
+    onDecrement: () -> Unit,
+    enabled: Boolean
+) {
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant
+        )
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                title,
+                style = MaterialTheme.typography.labelLarge
+            )
+
+            Text(
+                value.toString(),
+                style = MaterialTheme.typography.displaySmall,
+                fontWeight = FontWeight.Bold
+            )
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                IconButton(
+                    onClick = onDecrement,
+                    enabled = enabled && value > 0,
+                    modifier = Modifier.size(68.dp)
+                ) {
+                    Text(
+                        "−1",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                IconButton(
+                    onClick = onIncrement,
+                    enabled = enabled,
+                    modifier = Modifier.size(68.dp)
+                ) {
+                    Text(
+                        "+1",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
             }
         }
     }
@@ -479,7 +684,10 @@ fun CounterCard(title: String, value: Int, symbol: String, onClick: () -> Unit, 
 fun CompactStopCard(number: Int, stop: StopDraft) {
     Card {
         Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text("Остановка $number", fontWeight = FontWeight.SemiBold)
+            Text(
+                stop.name?.takeIf { it.isNotBlank() } ?: formatCoords(stop.latitude, stop.longitude),
+                fontWeight = FontWeight.SemiBold
+            )
             Text("Прибытие: ${formatDateTime(stop.arrivalTimeMillis)}")
             Text("Отправление: ${formatDateTime(stop.departureTimeMillis)}")
             Text("Вошло: ${stop.entered} • Вышло: ${stop.exited}")
@@ -531,10 +739,41 @@ fun HistoryCard(measurement: MeasurementEntity, onClick: () -> Unit) {
 fun DetailsScreen(vm: PassengerFlowViewModel, id: Long, nav: NavHostController) {
     val stops by vm.observeStops(id).collectAsState(initial = emptyList())
     val measurement by produceMeasurement(vm, id)
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     Scaffold(topBar = {
         TopAppBar(
             title = { Text(measurement?.name ?: "Детали") },
-            navigationIcon = { IconButton(onClick = { nav.navigateUp() }) { Icon(Icons.Default.ArrowBack, contentDescription = "Назад") } }
+            navigationIcon = {
+                IconButton(onClick = { nav.navigateUp() }) {
+                    Icon(
+                        Icons.Default.ArrowBack,
+                        contentDescription = "Назад"
+                    )
+                }
+            },
+            actions = {
+                IconButton(
+                    onClick = {
+                        val currentMeasurement = measurement ?: return@IconButton
+
+                        scope.launch {
+                            val csv = vm.buildCsv(id)
+
+                            shareCsv(
+                                context = context,
+                                measurementName = currentMeasurement.name,
+                                csv = csv
+                            )
+                        }
+                    }
+                ) {
+                    Icon(
+                        Icons.Default.Share,
+                        contentDescription = "Экспорт CSV"
+                    )
+                }
+            }
         )
     }) { padding ->
         LazyColumn(
@@ -544,7 +783,7 @@ fun DetailsScreen(vm: PassengerFlowViewModel, id: Long, nav: NavHostController) 
         ) {
             item {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text("Координаты", Modifier.weight(1f), fontWeight = FontWeight.Bold)
+                    Text("Остановка", Modifier.weight(1f), fontWeight = FontWeight.Bold)
                     Text("Прибытие", Modifier.weight(1f), fontWeight = FontWeight.Bold)
                     Text("Отправление", Modifier.weight(1f), fontWeight = FontWeight.Bold)
                     Text("Вошло", Modifier.width(54.dp), fontWeight = FontWeight.Bold)
@@ -564,7 +803,12 @@ fun StopDetailRow(stop: StopEntity) {
     val context = LocalContext.current
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-            Text(formatCoords(stop.latitude, stop.longitude), style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+            Text(
+                stop.name?.takeIf { it.isNotBlank() }
+                    ?: formatCoords(stop.latitude, stop.longitude),
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.weight(1f)
+            )
             IconButton(
                 onClick = { openMap(context, stop.latitude, stop.longitude) },
                 enabled = stop.latitude != null && stop.longitude != null
@@ -605,6 +849,45 @@ fun NameDialog(onDismiss: () -> Unit, onSave: (String) -> Unit) {
     )
 }
 
+@Composable
+fun StopNameDialog(
+    onDismiss: () -> Unit,
+    onSave: (String) -> Unit
+) {
+    var name by remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text("Название остановки")
+        },
+        text = {
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it },
+                singleLine = true,
+                label = {
+                    Text("Например: Центральная")
+                }
+            )
+        },
+        confirmButton = {
+            Button(
+                onClick = { onSave(name) }
+            ) {
+                Text("Сохранить")
+            }
+        },
+        dismissButton = {
+            OutlinedButton(
+                onClick = onDismiss
+            ) {
+                Text("Пропустить")
+            }
+        }
+    )
+}
+
 fun openMap(context: Context, latitude: Double?, longitude: Double?) {
     if (latitude == null || longitude == null) return
     val uri = Uri.parse("geo:$latitude,$longitude?q=$latitude,$longitude")
@@ -621,3 +904,9 @@ private fun formatCoords(lat: Double?, lon: Double?): String =
 private fun formatClock(millis: Long) = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(millis))
 private fun formatTime(millis: Long) = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(millis))
 private fun formatDateTime(millis: Long) = SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.getDefault()).format(Date(millis))
+private fun formatDate(millis: Long): String {
+    return SimpleDateFormat(
+        "dd.MM.yyyy",
+        Locale.getDefault()
+    ).format(Date(millis))
+}

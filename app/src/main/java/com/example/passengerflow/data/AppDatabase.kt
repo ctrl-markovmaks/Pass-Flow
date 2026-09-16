@@ -12,6 +12,8 @@ import androidx.room.Relation
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import kotlinx.coroutines.flow.Flow
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Entity(tableName = "measurements")
 data class MeasurementEntity(
@@ -24,6 +26,7 @@ data class MeasurementEntity(
 data class StopEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val measurementId: Long,
+    val name: String?,
     val latitude: Double?,
     val longitude: Double?,
     val arrivalTimeMillis: Long,
@@ -53,12 +56,21 @@ interface MeasurementDao {
     suspend fun findMeasurement(id: Long): MeasurementEntity?
 
     @Query("SELECT * FROM stops WHERE measurementId = :measurementId ORDER BY arrivalTimeMillis ASC")
+    suspend fun getStops(measurementId: Long): List<StopEntity>
+
+    @Query("SELECT * FROM stops WHERE measurementId = :measurementId ORDER BY arrivalTimeMillis ASC")
     fun observeStops(measurementId: Long): Flow<List<StopEntity>>
+}
+
+private val MIGRATION_1_2 = object : Migration(1, 2) {
+    override fun migrate(database: SupportSQLiteDatabase) {
+        database.execSQL("ALTER TABLE stops ADD COLUMN name TEXT")
+    }
 }
 
 @Database(
     entities = [MeasurementEntity::class, StopEntity::class],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -73,7 +85,9 @@ abstract class AppDatabase : RoomDatabase() {
                     context.applicationContext,
                     AppDatabase::class.java,
                     "passenger_flow.db"
-                ).build().also { INSTANCE = it }
+                ).addMigrations(MIGRATION_1_2)
+                    .build()
+                    .also { INSTANCE = it }
             }
     }
 }
