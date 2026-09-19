@@ -4,7 +4,7 @@
 
 
 
-Функции приложения:
+### Функции приложения:
 
 
 
@@ -38,9 +38,3 @@
 * Room 2.8.5
 * Google Play services Location 21.4.0
 * AGP 9.0.1 / Gradle 9.1.0 / JDK 17
-
-## Сборка
-
-Открыть корневую папку в Android Studio и выполнить Gradle Sync.
-Минимальная версия Android — API 26.
-
